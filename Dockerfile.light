@@ -1,7 +1,7 @@
 # Dockerfile.light - Versione leggera senza FlareSolverr/Byparr integrati
 # Ideale per uso con Docker Compose o solver esterni.
 
-FROM python:3.11-bookworm
+FROM python:3.12-bookworm
 
 # Imposta la directory di lavoro all'interno del container.
 WORKDIR /app
