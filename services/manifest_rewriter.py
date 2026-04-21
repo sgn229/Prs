@@ -243,7 +243,7 @@ class ManifestRewriter:
                     }
                 )
 
-        if generic_streams:
+        if len(generic_streams) > 1:
             highest_quality_stream = max(generic_streams, key=lambda x: x["bandwidth"])
             logger.debug(
                 "Generic HLS: selected max bandwidth %s.",
