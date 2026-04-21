@@ -2513,10 +2513,10 @@ class HLSProxy:
                             # ✅ CRITICAL: Aggiorna la sessione con i cookie freschi sbloccati
                             # Questo permetterà ai segmenti .ts successivi di funzionare!
                             target_sid = request.query.get("hls_sid")
-                            if target_sid and target_sid in self.header_sessions and sr_result.get("cookies"):
+                            if target_sid and target_sid in self.hls_header_sessions and sr_result.get("cookies"):
                                 try:
                                     fresh_cookies_str = "; ".join([f"{k}={v}" for k, v in sr_result["cookies"].items()])
-                                    self.header_sessions[target_sid]["Cookie"] = fresh_cookies_str
+                                    self.hls_header_sessions[target_sid]["Cookie"] = fresh_cookies_str
                                     logger.info(f"🔄 [Cookie Sync] Session {target_sid} updated with fresh cookies from fallback")
                                 except Exception as ce:
                                     logger.error(f"❌ Failed to sync cookies: {ce}")
