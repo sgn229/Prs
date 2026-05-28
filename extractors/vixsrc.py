@@ -14,6 +14,7 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyError as AioProxyError
 from python_socks import ProxyError as PyProxyError
 from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy, SELECTED_PROXY_CONTEXT
+from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class VixSrcExtractor:
         self.proxies = proxies or GLOBAL_PROXIES
         self.is_vixsrc = True
         self.last_used_proxy = None
+        self.flaresolverr_url = FLARESOLVERR_URL
+        self.flaresolverr_timeout = FLARESOLVERR_TIMEOUT
+        self._fs_cookies = None
+        self._fs_user_agent = None
     @staticmethod
     def _normalize_proxy_url(proxy_value: str) -> str:
         proxy_value = proxy_value.strip()
@@ -55,6 +60,57 @@ class VixSrcExtractor:
             "accept-encoding": "gzip, deflate",
             "connection": "keep-alive",
         }
+
+    async def _ensure_fs_cookies(self, target_url: str):
+        if self._fs_cookies and self._fs_user_agent:
+            return
+        site = self._normalize_base_site(target_url)
+        endpoint = f"{self.flaresolverr_url.rstrip('/')}/v1"
+        payload = {"cmd": "request.get", "url": site, "maxTimeout": (self.flaresolverr_timeout + 60) * 1000}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=self.flaresolverr_timeout + 95)) as r:
+                d = await r.json()
+        if d.get("status") != "ok":
+            raise ExtractorError(f"FlareSolverr: {d.get('message', '')}")
+        self._fs_cookies = {c["name"]: c["value"] for c in d["solution"].get("cookies", [])}
+        self._fs_user_agent = d["solution"].get("userAgent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        logger.info(f"VixSrc: FS cookies: {list(self._fs_cookies.keys())}")
+
+    async def _make_fs_request(self, url: str, headers: dict = None):
+        from curl_cffi.requests import AsyncSession as CurlAsyncSession
+        await self._ensure_fs_cookies(url)
+        cookie_str = "; ".join(f"{k}={v}" for k, v in self._fs_cookies.items())
+        final_headers = {
+            "User-Agent": self._fs_user_agent,
+            "Cookie": cookie_str,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        if headers:
+            final_headers.update(headers)
+        final_headers.pop("accept-encoding", None)
+
+        async with CurlAsyncSession(impersonate="chrome124") as sess:
+            r = await sess.get(url, headers=final_headers, timeout=30, allow_redirects=True)
+            html = r.text
+            logger.info(f"VixSrc FS: curl_cffi status={r.status_code} len={len(html) if html else 0} for {url}")
+            if r.status_code != 200:
+                raise ExtractorError(f"FlareSolverr fetch failed: HTTP {r.status_code} for {url}")
+            class MockResponse:
+                def __init__(self, text_content, status, response_url):
+                    self._text = text_content
+                    self.status = status
+                    self.status_code = status
+                    self.text = text_content
+                    self.url = response_url
+                    self.headers = {}
+                async def text_async(self):
+                    return self._text
+                def raise_for_status(self):
+                    if self.status >= 400:
+                        raise ExtractorError(f"FS HTTP error {self.status}")
+            return MockResponse(html, r.status_code, url)
 
     def _fresh_headers(self, **extra_headers) -> dict:
         headers = self._default_headers()
@@ -378,14 +434,24 @@ class VixSrcExtractor:
         if not api_url:
             return None
 
-        response = await self._make_robust_request(
-            api_url,
-            headers={
-                "accept": "application/json, text/plain, */*",
-                "referer": url,
-                **self._default_headers(),
-            },
-        )
+        try:
+            response = await self._make_fs_request(
+                api_url,
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "referer": url,
+                },
+            )
+        except Exception as fs_err:
+            logger.warning("FS failed for API, trying robust: %s", fs_err)
+            response = await self._make_robust_request(
+                api_url,
+                headers={
+                    "accept": "application/json, text/plain, */*",
+                    "referer": url,
+                    **self._default_headers(),
+                },
+            )
 
         try:
             payload = json.loads(response.text)
@@ -474,14 +540,20 @@ class VixSrcExtractor:
         """Ottiene la versione del sito VixSrc parent."""
         base_url = f"{site_url}/request-a-title"
 
-        response = await self._make_robust_request(
-            base_url,
-            headers={
-                "Referer": f"{site_url}/",
-                "Origin": f"{site_url}",
-                **self._default_headers(),
-            },
-        )
+        try:
+            response = await self._make_fs_request(
+                base_url,
+                headers={"referer": f"{site_url}/"},
+            )
+        except Exception:
+            response = await self._make_robust_request(
+                base_url,
+                headers={
+                    "Referer": f"{site_url}/",
+                    "Origin": f"{site_url}",
+                    **self._default_headers(),
+                },
+            )
 
         if response.status_code != 200:
             raise ExtractorError("Obsolete URL")
@@ -505,12 +577,23 @@ class VixSrcExtractor:
 
             if "/playlist/" in parsed_url.path:
                 logger.info("URL is already a VixSrc manifest, no extraction required.")
-                # Preserve selected_proxy from query if present
                 selected_proxy = kwargs.get("proxy") or parse_qs(parsed_url.query).get("proxy", [None])[0]
                 logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
+                stream_headers = self._fresh_headers()
+                # Use cookies and UA from the request (e.g. cf_clearance forwarded by redirect)
+                req_h = kwargs.get("request_headers") or {}
+                if req_h.get("Cookie"):
+                    stream_headers["Cookie"] = req_h["Cookie"]
+                if req_h.get("User-Agent"):
+                    stream_headers["User-Agent"] = req_h["User-Agent"]
+                if self._fs_cookies:
+                    cookie_str = "; ".join(f"{k}={v}" for k, v in self._fs_cookies.items())
+                    stream_headers["Cookie"] = cookie_str
+                    if self._fs_user_agent:
+                        stream_headers["User-Agent"] = self._fs_user_agent
                 return {
                     "destination_url": url,
-                    "request_headers": self._fresh_headers(),
+                    "request_headers": stream_headers,
                     "mediaflow_endpoint": self.mediaflow_endpoint,
                     "selected_proxy": selected_proxy or self.last_used_proxy,
                 }
@@ -518,32 +601,24 @@ class VixSrcExtractor:
             if "/embed/" in parsed_url.path:
                 self._raise_if_embed_expired(url)
                 if parsed_url.netloc.lower().endswith("vixcloud.co"):
-                    # Rewrite vixcloud.co → vixsrc.to to bypass Cloudflare
                     vix_url = url.replace("vixcloud.co", "vixsrc.to")
                     logger.info("Rewrote URL to vixsrc.to: %s", vix_url)
-                    try:
-                        response = await self._make_robust_request(
-                            vix_url,
-                            headers=self._fresh_headers(
-                                referer=vix_url
-                            ),
-                        )
-                    except Exception as robust_err:
-                        logger.warning("Robust request failed for vixsrc.to, trying curl_cffi: %s", robust_err)
-                        try:
-                            response = await self._make_curl_request(
-                                vix_url,
-                                headers={"referer": vix_url},
-                            )
-                        except Exception as curl_err:
-                            logger.warning("curl_cffi failed for vixsrc.to, no more fallbacks: %s", curl_err)
                 else:
-                    response = await self._make_robust_request(
-                        url,
-                        headers=self._fresh_headers(
-                            referer=self._normalize_base_site(url) + "/"
-                        ),
+                    vix_url = url
+                try:
+                    response = await self._make_fs_request(
+                        vix_url,
+                        headers={"referer": self._normalize_base_site(vix_url) + "/"},
                     )
+                except Exception as fs_err:
+                    logger.warning("FS failed for embed %s, trying curl_cffi: %s", vix_url, fs_err)
+                    try:
+                        response = await self._make_curl_request(
+                            vix_url,
+                            headers={"referer": self._normalize_base_site(vix_url) + "/"},
+                        )
+                    except Exception as curl_err:
+                        logger.warning("curl_cffi failed for %s, no more fallbacks: %s", vix_url, curl_err)
             elif "iframe" in url:
                 site_url = url.split("/iframe")[0]
                 version = await self.version(site_url)
@@ -568,12 +643,23 @@ class VixSrcExtractor:
             elif "/movie/" in parsed_url.path or "/tv/" in parsed_url.path:
                 embed_url = await self._resolve_embed_url_from_api(url)
                 if embed_url:
-                    response = await self._make_robust_request(
-                        embed_url,
-                        headers=self._fresh_headers(referer=url),
-                    )
+                    try:
+                        response = await self._make_fs_request(
+                            embed_url,
+                            headers={"referer": url},
+                        )
+                    except Exception as fs_err:
+                        logger.warning("FS failed for embed %s, trying robust: %s", embed_url, fs_err)
+                        response = await self._make_robust_request(
+                            embed_url,
+                            headers=self._fresh_headers(referer=url),
+                        )
                 else:
-                    response = await self._make_robust_request(url)
+                    try:
+                        response = await self._make_fs_request(url)
+                    except Exception as fs_err:
+                        logger.warning("FS failed for %s, trying robust: %s", url, fs_err)
+                        response = await self._make_robust_request(url)
             else:
                 raise ExtractorError("Unsupported VixSrc URL type")
 
@@ -632,6 +718,12 @@ class VixSrcExtractor:
             stream_url = url.replace("vixcloud.co", "vixsrc.to")
 
             stream_headers = self._fresh_headers(Referer=stream_url)
+            # Pass cf_clearance cookie so the streaming proxy can fetch playlist
+            if self._fs_cookies:
+                cookie_str = "; ".join(f"{k}={v}" for k, v in self._fs_cookies.items())
+                stream_headers["Cookie"] = cookie_str
+                if self._fs_user_agent:
+                    stream_headers["User-Agent"] = self._fs_user_agent
             logger.info("VixSrc URL extracted successfully: %s", final_url)
             return {
                 "destination_url": final_url,
