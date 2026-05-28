@@ -59,30 +59,33 @@ def parse_proxies(proxy_env_var: str) -> list:
 
 
 def parse_proxy_file(proxy_file_env_var: str) -> list:
-    """Read proxies from a txt file path stored in an env var, one proxy per line."""
-    file_path = os.environ.get(proxy_file_env_var, "").strip()
-    if not file_path:
+    """Read proxies from comma-separated file paths/URLs, one proxy per line."""
+    raw = os.environ.get(proxy_file_env_var, "").strip()
+    if not raw:
         return []
-    try:
-        if file_path.startswith(("http://", "https://")):
-            with urllib.request.urlopen(file_path, timeout=10) as response:
-                text = response.read().decode("utf-8", errors="ignore")
-        else:
-            with open(file_path, "r", encoding="utf-8") as file:
-                text = file.read()
-
-        proxies = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("="):
-                line = line[1:].strip()
-            if not line or line.startswith("#"):
-                continue
-            proxies.append(line)
-        return proxies
-    except Exception as e:
-        logger.warning(f"Error reading proxy file {file_path}: {e}")
-        return []
+    proxies = []
+    for path in raw.split(","):
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            if path.startswith(("http://", "https://")):
+                with urllib.request.urlopen(path, timeout=10) as response:
+                    text = response.read().decode("utf-8", errors="ignore")
+            else:
+                with open(path, "r", encoding="utf-8") as file:
+                    text = file.read()
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("="):
+                    line = line[1:].strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line not in proxies:
+                    proxies.append(line)
+        except Exception as e:
+            logger.warning(f"Error reading proxy file {path}: {e}")
+    return proxies
 
 
 def get_extractor_proxies(extractor_name: str) -> list:
