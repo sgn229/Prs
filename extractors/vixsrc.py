@@ -80,7 +80,9 @@ class VixSrcExtractor:
         proxies_to_try = []
         if warp:
             proxies_to_try.append(warp.replace("socks5h://", "socks5://", 1))
-        for proxy in self.proxies or []:
+        # FlareSolverr opens a browser per attempt; keep this short.
+        # Normal Cloudflare bypass is handled by curl_cffi proxy rotation first.
+        for proxy in (self.proxies or [])[:3]:
             if proxy and proxy not in proxies_to_try:
                 proxies_to_try.append(proxy.replace("socks5h://", "socks5://", 1))
         if None not in proxies_to_try:
@@ -451,24 +453,24 @@ class VixSrcExtractor:
         if not api_url:
             return None
 
+        api_headers = {
+            "accept": "application/json, text/plain, */*",
+            "referer": url,
+            **self._default_headers(),
+        }
         try:
-            response = await self._make_fs_request(
-                api_url,
-                headers={
-                    "accept": "application/json, text/plain, */*",
-                    "referer": url,
-                },
-            )
-        except Exception as fs_err:
-            logger.warning("FS failed for API, trying robust: %s", fs_err)
-            response = await self._make_robust_request(
-                api_url,
-                headers={
-                    "accept": "application/json, text/plain, */*",
-                    "referer": url,
-                    **self._default_headers(),
-                },
-            )
+            logger.info("Trying VixSrc API via curl_cffi proxy rotation: %s", api_url)
+            response = await self._make_curl_request(api_url, headers=api_headers)
+        except Exception as curl_err:
+            logger.warning("curl_cffi failed for API, trying robust: %s", curl_err)
+            try:
+                response = await self._make_robust_request(api_url, headers=api_headers)
+            except Exception as robust_err:
+                logger.warning("Robust failed for API, trying FS fallback: %s", robust_err)
+                response = await self._make_fs_request(
+                    api_url,
+                    headers={"accept": "application/json, text/plain, */*", "referer": url},
+                )
 
         try:
             payload = json.loads(response.text)
@@ -623,19 +625,19 @@ class VixSrcExtractor:
                 else:
                     vix_url = url
                 try:
-                    response = await self._make_fs_request(
+                    response = await self._make_curl_request(
                         vix_url,
-                        headers={"referer": self._normalize_base_site(vix_url) + "/"},
+                        headers=self._fresh_headers(referer=self._normalize_base_site(vix_url) + "/"),
                     )
-                except Exception as fs_err:
-                    logger.warning("FS failed for embed %s, trying curl_cffi: %s", vix_url, fs_err)
+                except Exception as curl_err:
+                    logger.warning("curl_cffi failed for embed %s, trying FS fallback: %s", vix_url, curl_err)
                     try:
-                        response = await self._make_curl_request(
+                        response = await self._make_fs_request(
                             vix_url,
                             headers={"referer": self._normalize_base_site(vix_url) + "/"},
                         )
-                    except Exception as curl_err:
-                        logger.warning("curl_cffi failed for %s, no more fallbacks: %s", vix_url, curl_err)
+                    except Exception as fs_err:
+                        logger.warning("FS failed for %s, no more fallbacks: %s", vix_url, fs_err)
             elif "iframe" in url:
                 site_url = url.split("/iframe")[0]
                 version = await self.version(site_url)
@@ -661,22 +663,33 @@ class VixSrcExtractor:
                 embed_url = await self._resolve_embed_url_from_api(url)
                 if embed_url:
                     try:
-                        response = await self._make_fs_request(
-                            embed_url,
-                            headers={"referer": url},
-                        )
-                    except Exception as fs_err:
-                        logger.warning("FS failed for embed %s, trying robust: %s", embed_url, fs_err)
-                        response = await self._make_robust_request(
+                        response = await self._make_curl_request(
                             embed_url,
                             headers=self._fresh_headers(referer=url),
                         )
+                    except Exception as curl_err:
+                        logger.warning("curl_cffi failed for embed %s, trying robust/FS: %s", embed_url, curl_err)
+                        try:
+                            response = await self._make_robust_request(
+                                embed_url,
+                                headers=self._fresh_headers(referer=url),
+                            )
+                        except Exception as robust_err:
+                            logger.warning("Robust failed for embed %s, trying FS fallback: %s", embed_url, robust_err)
+                            response = await self._make_fs_request(
+                                embed_url,
+                                headers={"referer": url},
+                            )
                 else:
                     try:
-                        response = await self._make_fs_request(url)
-                    except Exception as fs_err:
-                        logger.warning("FS failed for %s, trying robust: %s", url, fs_err)
-                        response = await self._make_robust_request(url)
+                        response = await self._make_curl_request(url)
+                    except Exception as curl_err:
+                        logger.warning("curl_cffi failed for %s, trying robust/FS: %s", url, curl_err)
+                        try:
+                            response = await self._make_robust_request(url)
+                        except Exception as robust_err:
+                            logger.warning("Robust failed for %s, trying FS fallback: %s", url, robust_err)
+                            response = await self._make_fs_request(url)
             else:
                 raise ExtractorError("Unsupported VixSrc URL type")
 
