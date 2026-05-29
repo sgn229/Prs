@@ -90,7 +90,7 @@ class HLSProxyManifestHandlerMixin:
                         base_url=captured_url,
                         proxy_base=proxy_base,
                         stream_headers=merged_headers,
-                        original_channel_url=request.query.get("url") or request.query.get("d", ""),
+                        original_channel_url=source_url or request.query.get("url") or request.query.get("d", ""),
                         api_password=request.query.get("api_password"),
                         get_extractor_func=lambda url, headers, host=None: self.get_extractor(
                             url, headers, host, bypass_warp=bypass_warp
